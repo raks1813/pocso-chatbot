@@ -202,40 +202,129 @@ def detect_power_imbalance(text):
             score += 1
 
     return score >= 2  # threshold (tune if needed)
+
+def extract_victim_age(text):
+    import re
+    text = text.lower()
+
+    # patterns where victim is explicitly mentioned
+    patterns = [
+        r"(girl|boy|child|minor|victim)[^0-9]{0,20}(\d{1,2})",
+        r"(\d{1,2})\s*year[s]?\s*old\s*(girl|boy|child|minor)",
+        r"(minor|victim)[^0-9]{0,10}aged\s*(\d{1,2})",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            for g in m.groups():
+                if g and g.isdigit():
+                    return int(g)
+
+    # fallback → choose smallest age (usually victim)
+    ages = re.findall(r"\b(\d{1,2})\b", text)
+    if ages:
+        return min([int(a) for a in ages])
+
+    return None
+
+def extract_roles(text):
+    text = text.lower()
+
+    victim_words = ["girl", "boy", "child", "minor", "victim"]
+    accused_words = ["man", "male", "accused", "person"]
+
+    victim_present = any(word in text for word in victim_words)
+    accused_present = any(word in text for word in accused_words)
+
+    return victim_present, accused_present
+
+def detect_entities_and_timeline(text):
+    import re
+    text = text.lower()
+
+    # victim indicators
+    victim_words = ["girl", "boy", "child", "minor", "victim"]
+    accused_words = ["man", "men", "accused", "person", "persons"]
+
+    # count occurrences
+    victim_count = sum(text.count(word) for word in victim_words)
+    accused_count = sum(text.count(word) for word in accused_words)
+
+    multiple_victims = victim_count > 1
+    multiple_accused = accused_count > 1
+
+    # repeated offence detection
+    repeat_patterns = [
+        "repeated", "again", "multiple times", "several times",
+        "on many occasions", "continuously", "frequently",
+        "daily", "over a period", "for months", "for years"
+    ]
+
+    repeated = any(p in text for p in repeat_patterns)
+
+    return multiple_victims, multiple_accused, repeated
+
 # -------------------- CLASSIFICATION --------------------
+def check_sexual_intent(text):
+    text = text.lower()
+
+    keywords = [
+        "sexual", "intent", "arousal", "porn",
+        "private parts", "genitals", "breast",
+        "kissed", "fondled", "groped",
+        "molest", "molestation"
+    ]
+
+    return any(word in text for word in keywords)
+
 def classify_offence(text):
     age = extract_victim_age(text)
     penetration = check_penetration(text)
     touching = check_touching(text)
     aggravated = check_aggravated(text)
+    sexual_intent = check_sexual_intent(text)
+
+    # NEW
+    multiple_victims, multiple_accused, repeated = detect_entities_and_timeline(text)
 
     sections = []
     reasoning = []
 
-    if age and age < 18:
+    if age is not None and age < 18:
         reasoning.append("Victim is a minor.")
 
+        if multiple_victims:
+            reasoning.append("Multiple victims detected.")
+
+        if multiple_accused:
+            reasoning.append("Multiple accused detected.")
+
+        if repeated:
+            reasoning.append("Repeated offence / continuing act detected.")
+            aggravated = True  # 🔥 important
+
         if penetration:
-            reasoning.append("Penetration detected.")
-
             if aggravated:
-                sections = ["Section 5", "Section 6"]
-                reasoning.append("Aggravated factors present.")
+                sections.append("Section 5 → Aggravated Penetrative Sexual Assault")
+                sections.append("Punishment: Section 6")
             else:
-                sections = ["Section 3", "Section 4"]
+                sections.append("Section 3 → Penetrative Sexual Assault")
+                sections.append("Punishment: Section 4")
 
-        elif touching:
-            sections = ["Section 7", "Section 8"]
-            reasoning.append("Sexual touching detected.")
-
+        elif touching and sexual_intent:
             if aggravated:
-                reasoning.append("Aggravated context present.")
+                sections.append("Section 9 → Aggravated Sexual Assault")
+                sections.append("Punishment: Section 10")
+            else:
+                sections.append("Section 7 → Sexual Assault")
+                sections.append("Punishment: Section 8")
 
         else:
-            reasoning.append("Insufficient clarity of act.")
+            sections.append("Facts may be insufficient to classify.")
 
     else:
-        reasoning.append("POCSO may not apply (age unclear).")
+        sections.append("POCSO may not apply (victim not clearly a minor).")
 
     return {
         "age": age,
@@ -243,9 +332,11 @@ def classify_offence(text):
         "touching": touching,
         "aggravated": aggravated,
         "sections": sections,
-        "reasoning": reasoning
+        "reasoning": reasoning,
+        "multiple_victims": multiple_victims,
+        "multiple_accused": multiple_accused,
+        "repeated": repeated
     }
-
 # -------------------- AI REASONING --------------------
 def ai_analysis(user_input, rule_output, matched_cases):
     client = get_client()
