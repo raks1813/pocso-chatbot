@@ -1,196 +1,380 @@
-import os
-import re
-
 import streamlit as st
-st.sidebar.title("About")
-st.sidebar.info(
-    "This tool analyses case facts under Sections 3–8 of the POCSO Act.\n\n"
-    "For academic and research purposes only."
-)
-from openai import OpenAI
-
-
-st.title("⚖️ POCSO Offence Detection System")
-st.markdown("### Sections 3–8 Analysis Tool")
-st.markdown(
-    "Enter case facts to identify offences under the POCSO Act."
-)
-
-
+import pandas as pd
+import re
 import os
+st.markdown("""
+<style>
+body {
+    background-color: #0b0f19;
+    color: #ffffff;
+}
+
+.block {
+    background-color: #111827;
+    padding: 20px;
+    border-radius: 10px;
+    border-left: 5px solid #3b82f6;
+    margin-bottom: 15px;
+    color: white;
+}
+
+.section-box {
+    background-color: #1f2937;
+    color: #ffffff;
+    padding: 12px;
+    border-radius: 8px;
+    margin: 6px 0;
+    font-weight: bold;
+}
+
+.case-box {
+    background-color: #1e293b;
+    color: #ffffff;
+    padding: 10px;
+    border-radius: 8px;
+    margin-bottom: 8px;
+}
+
+h1, h2, h3 {
+    color: #93c5fd;
+}
+</style>
+""", unsafe_allow_html=True)
 from openai import OpenAI
+
+st.set_page_config(page_title="POCSO Legal AI", layout="wide")
+
+# -------------------- LOAD DATASET --------------------
+@st.cache_data
+def load_cases():
+    return pd.read_excel("cases.xlsx")
+
+cases_df = load_cases()
+
+# -------------------- OPENAI --------------------
 def get_client():
-    import os
-    from openai import OpenAI
-    return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key)
 
+# -------------------- BASIC EXTRACTION --------------------
+def extract_victim_age(text):
+    import re
+    text = text.lower()
 
-def extract_age(text):
-    match = re.search(r"(\d{1,2})\s*years?", text.lower())
-    if match:
-        return int(match.group(1))
+    # explicitly capture victim/minor/girl age
+    m = re.search(r"(girl|boy|child|minor|victim)[^0-9]{0,15}(\d{1,2})", text)
+    if m:
+        return int(m.group(2))
+
+    # capture "15 year old girl"
+    m = re.search(r"(\d{1,2})\s*year[s]?\s*old\s*(girl|boy|child|minor)", text)
+    if m:
+        return int(m.group(1))
+
+    # capture "minor aged 15"
+    m = re.search(r"(minor|victim)[^0-9]{0,10}aged\s*(\d{1,2})", text)
+    if m:
+        return int(m.group(2))
+
     return None
 
-
+# -------------------- RULE ENGINE --------------------
 def check_penetration(text):
     keywords = [
-        "penetration",
-        "penetrated",
-        "inserted",
-        "rape",
-        "penis",
-        "object inserted",
-        "oral sex",
+        "rape", "penetration", "penetrated",
+        "intercourse", "inserted", "oral sex",
+        "forced himself", "forced herself"
     ]
-    lowered = text.lower()
-    return any(word in lowered for word in keywords)
-
+    return any(k in text.lower() for k in keywords)
 
 def check_touching(text):
     keywords = [
-        "touched",
-        "touching",
-        "fondled",
-        "groped",
-        "kissed",
-        "hugged inappropriately",
+        "touched", "fondled", "groped", "kissed",
+        "grabbed", "pressed", "hugged"
     ]
-    lowered = text.lower()
-    return any(word in lowered for word in keywords)
+    return any(k in text.lower() for k in keywords)
 
+def get_aggravating_keywords():
+    factors = set()
+    if "aggravating" in cases_df.columns:
+        for item in cases_df["aggravating"].dropna():
+            for word in str(item).split(","):
+                factors.add(word.strip().lower())
+    return list(factors)
+
+AGGRAVATED_WORDS = get_aggravating_keywords()
 
 def check_aggravated(text):
+    import re
+    text = text.lower()
+
+    # direct keywords (still useful)
     keywords = [
-        "father",
-        "mother",
-        "relative",
-        "teacher",
-        "police",
-        "guardian",
-        "custody",
-        "authority",
-        "threat",
-        "weapon",
-        "injury",
-        "repeated",
+        "father", "mother", "uncle", "aunt", "brother", "sister",
+        "relative", "guardian", "stepfather",
+        "teacher", "police", "doctor", "caretaker",
+        "threat", "weapon", "injury", "repeated", "threatened"
     ]
-    lowered = text.lower()
-    return any(word in lowered for word in keywords)
 
+    if any(word in text for word in keywords):
+        return True
 
-def check_sexual_intent(text):
-    keywords = [
-        "sexual",
-        "intent",
-        "arousal",
-        "porn",
-        "private parts",
+    # 🔥 pattern-based trust detection
+    trust_patterns = [
+        r"someone (the )?victim trusted",
+        r"known to (her|him)",
+        r"close (family|relative|person)",
+        r"in a position of trust",
+        r"family friend",
+        r"staying with",
+        r"living with",
+        r"under (his|her) care",
+        r"caretaking",
+        r"looked after (her|him)",
+        r"entrusted with (her|him)",
     ]
-    lowered = text.lower()
-    return any(word in lowered for word in keywords)
 
+    for pattern in trust_patterns:
+        if re.search(pattern, text):
+            return True
+    if detect_power_imbalance(text):
+        return True
 
+    return False
+# -------------------- CASE MATCHING --------------------
+def match_cases(user_input):
+    matches = []
+    user_words = user_input.lower().split()
+
+    for _, row in cases_df.iterrows():
+        facts = str(row.get("facts_summary", "")).lower()
+
+        score = sum(1 for word in user_words if word in facts)
+
+        if score > 3:
+            matches.append({
+                "case": row.get("case_name", "Unknown"),
+                "sections": row.get("sections", ""),
+                "aggravating": row.get("aggravating", "")
+            })
+
+    return matches[:3]
+
+def detect_power_imbalance(text):
+    import re
+    text = text.lower()
+
+    score = 0
+
+    # authority / control
+    authority_patterns = [
+        r"teacher", r"police", r"doctor", r"employer", r"boss",
+        r"guardian", r"caretaker", r"custody", r"warden",
+        r"in charge", r"supervisor"
+    ]
+
+    # economic dependency
+    economic_patterns = [
+        r"paid", r"money", r"financial", r"dependent",
+        r"provided (food|shelter|fees)", r"sponsored",
+        r"employer", r"salary"
+    ]
+
+    # physical dominance / coercion
+    physical_patterns = [
+        r"stronger", r"overpowered", r"forced", r"restrained",
+        r"threat", r"weapon", r"violence", r"intimidation",
+        r"beat", r"injury"
+    ]
+
+    # age gap (very important)
+    ages = re.findall(r"(\d{1,2})", text)
+    if len(ages) >= 2:
+        ages = [int(a) for a in ages]
+        if max(ages) - min(ages) >= 10:
+            score += 1
+
+    # check all patterns
+    for group in [authority_patterns, economic_patterns, physical_patterns]:
+        if any(re.search(p, text) for p in group):
+            score += 1
+
+    return score >= 2  # threshold (tune if needed)
+# -------------------- CLASSIFICATION --------------------
 def classify_offence(text):
-    age = extract_age(text)
+    age = extract_victim_age(text)
     penetration = check_penetration(text)
     touching = check_touching(text)
     aggravated = check_aggravated(text)
-    sexual_intent = check_sexual_intent(text)
 
-    result = []
+    sections = []
+    reasoning = []
 
-    if age is not None and age < 18:
+    if age and age < 18:
+        reasoning.append("Victim is a minor.")
+
         if penetration:
+            reasoning.append("Penetration detected.")
+
             if aggravated:
-                result.append("Section 5 -> Aggravated Penetrative Sexual Assault")
-                result.append("Punishment: Section 6")
+                sections = ["Section 5", "Section 6"]
+                reasoning.append("Aggravated factors present.")
             else:
-                result.append("Section 3 -> Penetrative Sexual Assault")
-                result.append("Punishment: Section 4")
-        elif touching and sexual_intent:
-            result.append("Section 7 -> Sexual Assault")
-            result.append("Punishment: Section 8")
+                sections = ["Section 3", "Section 4"]
+
+        elif touching:
+            sections = ["Section 7", "Section 8"]
+            reasoning.append("Sexual touching detected.")
+
+            if aggravated:
+                reasoning.append("Aggravated context present.")
+
         else:
-            result.append("Facts may be insufficient to classify Sections 3-8 confidently.")
+            reasoning.append("Insufficient clarity of act.")
+
     else:
-        result.append("POCSO may not apply (victim not clearly a minor).")
+        reasoning.append("POCSO may not apply (age unclear).")
 
-    return result, age, penetration, touching, aggravated, sexual_intent
+    return {
+        "age": age,
+        "penetration": penetration,
+        "touching": touching,
+        "aggravated": aggravated,
+        "sections": sections,
+        "reasoning": reasoning
+    }
 
-
-def ai_analysis(user_input):
+# -------------------- AI REASONING --------------------
+def ai_analysis(user_input, rule_output, matched_cases):
     client = get_client()
-    if client is None:
-        return (
-            "Set the `OPENAI_API_KEY` environment variable to enable AI legal reasoning. "
-            "The rule-based analysis still works without it."
-        )
+    if not client:
+        return "AI unavailable (check API key)."
+
+    case_text = "\n".join([
+        f"{c['case']} → Sections: {c['sections']}, Aggravating: {c['aggravating']}"
+        for c in matched_cases
+    ])
 
     prompt = f"""
-You are a legal analysis assistant for educational use only.
-Analyse the given facts strictly under Sections 3, 4, 5, 6, 7, and 8 of the POCSO Act.
-Do not go beyond the facts provided. If facts are unclear, say so explicitly.
-
-Use this format:
-1. Extracted Facts
-2. Legal Ingredients
-   - Age
-   - Nature of Act
-   - Sexual Intent
-   - Aggravating Factors
-3. Applicable Section(s)
-4. Legal Reasoning
-5. Conclusion
+Analyse the case under POCSO Sections 3–8.
 
 Facts:
 {user_input}
-""".strip()
+
+Rule Findings:
+{rule_output}
+
+Relevant Cases:
+{case_text}
+
+Provide structured legal reasoning:
+1. Facts
+2. Ingredients
+3. Section applicability
+4. Legal reasoning
+5. Conclusion
+"""
 
     response = client.responses.create(
         model="gpt-5-mini",
-        input=prompt,
+        input=prompt
     )
 
     return response.output_text
 
+# -------------------- UI --------------------
+st.title("⚖️ POCSO Legal Analysis System")
+st.caption("Hybrid Rule-Based + AI Legal Reasoning Engine")
 
-st.title("POCSO Offence Detection Chatbot (Sections 3-8)")
-st.write("Analyse facts to detect possible offences under the POCSO Act with legal reasoning.")
+user_input = st.text_area("📝 Enter Case Facts", height=150)
 
-user_input = st.text_area(
-    "📝 Enter Case Facts",
-    placeholder="Example: A 14 year old girl was assaulted by her teacher...",
-    height=150
-)
 if st.button("🔍 Analyse Case"):
 
-    result, age, penetration, touching, aggravated, sexual_intent = classify_offence(user_input)
+    rule_output = classify_offence(user_input)
+    matched = match_cases(user_input)
 
-    st.subheader("📊 Rule-Based Analysis")
+    # ---------------- FACTS ----------------
+    st.markdown('<div class="block">', unsafe_allow_html=True)
+    st.subheader("📌 Facts Presented")
+    st.write(user_input)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    col1, col2 = st.columns(2)
+    # ---------------- ISSUES ----------------
+    st.markdown('<div class="block">', unsafe_allow_html=True)
+    st.subheader("⚖️ Issues for Determination")
 
-    with col1:
-        st.metric("Age", age if age else "Not Found")
-        st.metric("Penetration", "Yes" if penetration else "No")
+    if rule_output["penetration"]:
+        st.write("- Whether penetrative sexual assault occurred")
+    elif rule_output["touching"]:
+        st.write("- Whether sexual assault (non-penetrative) occurred")
+    else:
+        st.write("- Whether facts disclose an offence under POCSO")
 
-    with col2:
-        st.metric("Touching", "Yes" if touching else "No")
-        st.metric("Aggravated", "Yes" if aggravated else "No")
+    if rule_output["aggravated"]:
+        st.write("- Whether aggravating circumstances exist")
 
-    st.markdown("### ⚖️ Suggested Sections")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    for item in result:
-        st.success(item)
+    # ---------------- FINDINGS ----------------
+    st.markdown('<div class="block">', unsafe_allow_html=True)
+    st.subheader("🔎 Findings")
 
+    st.write(f"**Age Detected:** {rule_output['age']}")
+    st.write(f"**Penetration:** {rule_output['penetration']}")
+    st.write(f"**Touching:** {rule_output['touching']}")
+    st.write(f"**Aggravated Factors:** {rule_output['aggravated']}")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ---------------- LAW ----------------
+    st.markdown('<div class="block">', unsafe_allow_html=True)
+    st.subheader("📚 Applicable Law")
+
+    if rule_output["sections"]:
+        for sec in rule_output["sections"]:
+            st.markdown(f'<div class="section-box">{sec}</div>', unsafe_allow_html=True)
+    else:
+        st.warning("No clear section determined.")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ---------------- REASONING ----------------
+    st.markdown('<div class="block">', unsafe_allow_html=True)
+    st.subheader("📖 Rule-Based Reasoning")
+
+    for r in rule_output["reasoning"]:
+        st.write(f"- {r}")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ---------------- CASE LAW ----------------
+    st.markdown('<div class="block">', unsafe_allow_html=True)
+    st.subheader("📚 Similar Case References")
+
+    if matched:
+        for m in matched:
+            st.markdown(
+                f'<div class="case-box"><b>{m["case"]}</b><br>Sections: {m["sections"]}<br>Aggravating: {m["aggravating"]}</div>',
+                unsafe_allow_html=True
+            )
+    else:
+        st.write("No close matches found.")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ---------------- AI ----------------
+    st.markdown('<div class="block">', unsafe_allow_html=True)
     st.subheader("🤖 AI Legal Reasoning")
 
     try:
-        with st.spinner("Analysing legally..."):
-            st.info(ai_analysis(user_input))
+        with st.spinner("Analysing..."):
+            st.write(ai_analysis(user_input, rule_output, matched))
     except:
-        st.warning("AI analysis unavailable (quota issue).")
+        st.warning("AI unavailable.")
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown("---")
-st.markdown("---")
-st.caption("⚠️ This tool is for educational purposes only and does not constitute legal advice.")
+st.caption("⚠️ This tool is for academic purposes and does not constitute legal advice.")
